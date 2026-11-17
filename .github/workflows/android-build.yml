@@ -1,0 +1,219 @@
+name: LIVE PRO Cloud APK Builder
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    name: Build & Verify LIVE PRO Release Candidate (Debug + Signed Release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Step 1 — Read-only source and XML validation
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          root = Path("app/src/main")
+          xml_files = sorted(root.rglob("*.xml"))
+          if not xml_files:
+              raise SystemExit("No Android XML resources found")
+          for path in xml_files:
+              ET.parse(path)
+          required = [
+              root / "AndroidManifest.xml",
+              root / "res/xml/network_security_config.xml",
+              root / "res/drawable/app_logo.png",
+              root / "res/drawable/tv_banner.png",
+          ]
+          missing = [str(p) for p in required if not p.is_file() or p.stat().st_size == 0]
+          if missing:
+              raise SystemExit("Missing or empty required files: " + ", ".join(missing))
+          gradle = Path("app/build.gradle").read_text(encoding="utf-8")
+          if "proguard-rules.pro' '" in gradle:
+              raise SystemExit("Malformed proguardFiles declaration")
+          for path in root.rglob("*.kt"):
+              source = path.read_text(encoding="utf-8")
+              # Match Git conflict-marker lines only; ignore decorative comment separators.
+              if re.search(r"(?m)^(?:<<<<<<< .+|=======$|>>>>>>> .+)$", source):
+                  raise SystemExit(f"Git merge-conflict marker found in {path}")
+          print(f"Validated {len(xml_files)} XML files and required Android resources.")
+          PY
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configure Pre-installed Android SDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          elif [ -x "$ANDROID_HOME/tools/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/tools/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Install Gradle Manually (No Cache)
+        run: |
+          echo "🚀 Installing Gradle 8.6 Manually (No Cache — Tencent Cloud Mirror + Multi-Mirror Fallback)..."
+          mkdir -p /tmp/gradle_dl /opt/gradle
+          GRADLE_ZIP="/tmp/gradle_dl/gradle-8.6-bin.zip"
+          for MIRROR_URL in             "https://mirrors.cloud.tencent.com/gradle/gradle-8.6-bin.zip"             "https://github.com/gradle/gradle-distributions/releases/download/v8.6.0/gradle-8.6-bin.zip"             "https://mirrors.aliyun.com/macports/distfiles/gradle/gradle-8.6-bin.zip"             "https://services.gradle.org/distributions/gradle-8.6-bin.zip"; do
+            echo "📥 Downloading Gradle 8.6 from: $MIRROR_URL"
+            if wget -q --timeout=25 --tries=2 --waitretry=2 -O "$GRADLE_ZIP" "$MIRROR_URL" ||                curl -fsSL --connect-timeout 20 --max-time 90 --retry 2 -o "$GRADLE_ZIP" "$MIRROR_URL"; then
+              if [ -s "$GRADLE_ZIP" ] && unzip -tq "$GRADLE_ZIP" >/dev/null 2>&1; then
+                echo "✅ Successfully downloaded valid Gradle 8.6 archive!"
+                break
+              fi
+            fi
+            rm -f "$GRADLE_ZIP"
+          done
+          test -s "$GRADLE_ZIP"
+          unzip -q -o "$GRADLE_ZIP" -d /opt/gradle
+          chmod +x /opt/gradle/gradle-8.6/bin/gradle
+          echo "/opt/gradle/gradle-8.6/bin" >> "$GITHUB_PATH"
+          export PATH="/opt/gradle/gradle-8.6/bin:$PATH"
+          cat << 'EOF_GW' > ./gradlew
+          #!/usr/bin/env bash
+          if [ -x /opt/gradle/gradle-8.6/bin/gradle ]; then
+            exec /opt/gradle/gradle-8.6/bin/gradle "$@"
+          else
+            exec gradle "$@"
+          fi
+          EOF_GW
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Step 2 — Restore and Verify the ORIGINAL Persistent Signing Key
+        env:
+          KEYSTORE_B64: ${{ secrets.LIVEPRO_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.LIVEPRO_STORE_PASS || 'LiveProReleaseKey2026' }}
+          KEY_PASS: ${{ secrets.LIVEPRO_KEY_PASS || 'LiveProReleaseKey2026' }}
+          KEY_ALIAS: ${{ secrets.LIVEPRO_KEY_ALIAS || 'livepro_key' }}
+        run: |
+          set -euo pipefail
+          mkdir -p keystore
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 --decode > keystore/livepro-release.jks
+          elif [ -s keystore/livepro-release.jks ]; then
+            echo "Using the existing repository keystore."
+          else
+            echo "ERROR: LIVEPRO_KEYSTORE_BASE64 is missing. Refusing to generate a new signing key."
+            echo "Run: bash configure_github_signing_secret.sh (after gh auth login), then rerun this workflow."
+            exit 1
+          fi
+          test -s keystore/livepro-release.jks
+          keytool -list -keystore keystore/livepro-release.jks -storepass "$STORE_PASS" -alias "$KEY_ALIAS" >/dev/null
+          EXPECTED_FP="97:5C:3F:B0:E2:17:C6:26:42:3B:C2:6F:53:9F:DC:5C:13:A8:3C:68:5C:1A:C9:3D:23:29:A2:2F:88:8E:91:77"
+          ACTUAL_FP="$(keytool -list -v -keystore keystore/livepro-release.jks -storepass "$STORE_PASS" -alias "$KEY_ALIAS" | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1)"
+          if [ "$ACTUAL_FP" != "$EXPECTED_FP" ]; then
+            echo "ERROR: Signing certificate fingerprint mismatch. Build stopped to protect app update compatibility."
+            exit 1
+          fi
+          echo "Verified original LIVE PRO signing certificate."
+
+      - name: Step 3 — Build Debug APK (assembleDebug)
+        env:
+          LIVEPRO_STORE_PASS: ${{ secrets.LIVEPRO_STORE_PASS || 'LiveProReleaseKey2026' }}
+          LIVEPRO_KEY_PASS: ${{ secrets.LIVEPRO_KEY_PASS || 'LiveProReleaseKey2026' }}
+          LIVEPRO_KEY_ALIAS: ${{ secrets.LIVEPRO_KEY_ALIAS || 'livepro_key' }}
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee build_debug.log
+
+      - name: Step 4 — Run Unit Tests
+        run: |
+          ./gradlew --no-daemon --stacktrace testDebugUnitTest
+
+      - name: Step 5 — Run Static Analysis (Lint Gate)
+        run: |
+          ./gradlew --no-daemon --stacktrace lintDebug
+
+      - name: Step 6 — Build Signed Release APK (assembleRelease)
+        env:
+          LIVEPRO_STORE_PASS: ${{ secrets.LIVEPRO_STORE_PASS || 'LiveProReleaseKey2026' }}
+          LIVEPRO_KEY_PASS: ${{ secrets.LIVEPRO_KEY_PASS || 'LiveProReleaseKey2026' }}
+          LIVEPRO_KEY_ALIAS: ${{ secrets.LIVEPRO_KEY_ALIAS || 'livepro_key' }}
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee build_release.log
+
+      - name: Print Compiler Diagnostics on Failure
+        if: failure()
+        run: |
+          echo "=== KOTLIN / GRADLE ERRORS ==="
+          if [ -f build_debug.log ] || [ -f build_release.log ]; then
+            cat build_debug.log build_release.log 2>/dev/null | grep -E "(^e: |FAILURE:|What went wrong:|Execution failed for task|Unresolved reference|Type mismatch)" -A 8 || true
+            [ -f build_debug.log ] && tail -n 100 build_debug.log || true
+            [ -f build_release.log ] && tail -n 100 build_release.log || true
+          else
+            echo "No build_debug.log or build_release.log generated yet."
+          fi
+
+      - name: Step 7 — Verify APK Existence, Signature (apksigner) & SHA-256 Checksums
+        run: |
+          mkdir -p dist
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          cp -f app/build/outputs/apk/debug/app-debug.apk dist/LIVE-PRO-debug.apk
+
+          test -s app/build/outputs/apk/release/app-release.apk
+          cp -f app/build/outputs/apk/release/app-release.apk dist/LIVE-PRO-release-signed.apk
+
+          APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+          test -n "$APKSIGNER"
+          echo "Verifying signed Release APK..."
+          "$APKSIGNER" verify --verbose --print-certs dist/LIVE-PRO-release-signed.apk
+
+          cp -f server_portal/customer_portal.php dist/customer_portal.php || true
+          if [ -f app/build/reports/lint-results-debug.txt ]; then
+            cp -f app/build/reports/lint-results-debug.txt dist/lint-results-debug.txt
+          fi
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload Build Artifacts (Debug + Signed Release + Customer Portal PHP)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PLAYER-VIP-APKs
+          path: |
+            dist/*.apk
+            dist/customer_portal.php
+            dist/SHA256SUMS.txt
+            dist/lint-results-debug.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Official GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v28.0.${{ github.run_number }}
+          name: "LIVE PRO v28.0 Release Candidate (Build #${{ github.run_number }})"
+          body: |
+            ### 🚀 LIVE PRO v28.0 — Release Candidate
+            - معمارية مفصولة الطبقات (UI + ViewModel + Repository + SQLite Local DB).
+            - مشغل داخلي مزدوج (ExoPlayer Media3 + محرك VLC الداخلي المدمج LibVLC).
+            - مزامنة لحظية ثنائية الاتجاه مع فضاء الزبون (customer_portal.php) وزر إظهار/إخفاء رمز الشاشة.
+            - تسريع فائق للأفلام والمسلسلات والأجهزة الضعيفة ودعم كامل لأندرويد 14 وريموت التلفاز (D-Pad).
+          files: |
+            dist/*.apk
+            dist/customer_portal.php
+            dist/SHA256SUMS.txt
+          prerelease: false
+        continue-on-error: true
