@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="deep_navy">#FF000000</color>
+    <color name="obsidian_bg">#FF070A0D</color>
+    <color name="surface_dark">#FF182329</color>
+    <color name="surface_elevated">#FF1E2B33</color>
+    <color name="cyan_primary">#FFD4AF37</color>
+    <color name="cyan_dark">#FFBF9543</color>
+    <color name="netflix_red">#FFEF4444</color>
+    <color name="violet_secondary">#FFD4AF37</color>
+    <color name="text_primary">#FFF5F7FA</color>
+    <color name="text_secondary">#FFB0BEC5</color>
+    <color name="text_tertiary">#FF788994</color>
+    <color name="success_green">#FF10B981</color>
+    <color name="error_red">#FFEF4444</color>
+    <color name="warning_amber">#FFF59E0B</color>
+    <color name="live_badge">#FFEF4444</color>
+    <color name="gold_primary">#FFD4AF37</color>
+    <color name="gold_dark">#FF9E7628</color>
+    <color name="bg_black">#FF000000</color>
+    <color name="white">#FFF5F7FA</color>
+</resources>
